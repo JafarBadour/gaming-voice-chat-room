@@ -477,7 +477,7 @@ class LoginPage(QWidget):
 
         self._addr = QLineEdit()
         self._addr.setPlaceholderText("Server address  (e.g. 192.168.1.5:9753)")
-        self._addr.setText("localhost:9753")
+        self._addr.setText("16.62.171.242:9753")
         self._addr.setFixedWidth(360)
         box.addWidget(self._addr, alignment=Qt.AlignCenter)
 
