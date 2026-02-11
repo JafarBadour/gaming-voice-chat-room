@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Voice Chat Client
-=================
-PyQt5 desktop application with push-to-talk voice chat.
+Voice Chat Client (WebRTC)
+==========================
+PyQt5 desktop application with push-to-talk / open-mic voice chat.
+Audio is transported over a WebRTC DataChannel (unreliable + unordered,
+UDP-like) for low-latency, non-blocking communication.
 
 Run:
     python client.py
@@ -12,22 +14,27 @@ import sys
 import json
 import threading
 import queue
+import asyncio
 
 import ctypes
 import ctypes.wintypes
 
 import numpy as np
 import sounddevice as sd
-import websocket
+from aiortc import RTCPeerConnection, RTCSessionDescription
+import websockets
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QMessageBox,
     QSizePolicy,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtGui import QFont
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Windows API for global key-state polling (no hooks / no admin needed)
+# ═══════════════════════════════════════════════════════════════════════════
 _user32 = ctypes.windll.user32
 _GetAsyncKeyState = _user32.GetAsyncKeyState
 _GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -56,6 +63,7 @@ _VK_NAMES: dict[int, str] = {
     0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
 }
 
+
 def _vk_name(vk: int) -> str:
     """Return a human-readable name for a Windows virtual-key code."""
     if vk in _VK_NAMES:
@@ -66,13 +74,14 @@ def _vk_name(vk: int) -> str:
         return chr(vk)
     return f"KEY 0x{vk:02X}"
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Audio configuration
 # ═══════════════════════════════════════════════════════════════════════════
-SAMPLE_RATE  = 16000
+SAMPLE_RATE    = 16000
 AUDIO_CHANNELS = 1
-BLOCK_SIZE   = 1024        # ~64 ms at 16 kHz
-DTYPE        = "int16"
+BLOCK_SIZE     = 1024        # ~64 ms at 16 kHz
+DTYPE          = "int16"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Dark theme (Catppuccin Mocha–inspired)
@@ -160,27 +169,91 @@ QFrame#separator { background-color: #313244; max-height: 1px; }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AudioManager — capture + playback via sounddevice
+# AudioManager — capture + playback with multi-user mixing
 # ═══════════════════════════════════════════════════════════════════════════
+class _SourceBuffer:
+    """Per-source jitter buffer.
+
+    Accumulates PRE_BUFFER chunks before starting playback.
+    If the buffer briefly runs dry (network jitter), the last
+    known chunk is *repeated* instead of outputting silence,
+    which sounds like a tiny sustain rather than a hard cut.
+    """
+
+    PRE_BUFFER  = 5             # chunks to buffer before playing (~320 ms)
+    STALE_LIMIT = 50            # consecutive empty reads before resetting
+
+    def __init__(self):
+        self.q = queue.Queue(maxsize=60)
+        self._started = False
+        self._empty_streak = 0
+        self._last_chunk: bytes | None = None
+
+    def put(self, data: bytes):
+        try:
+            self.q.put_nowait(data)
+        except queue.Full:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.q.put_nowait(data)
+            except queue.Full:
+                pass
+
+    def get(self) -> bytes | None:
+        """Return one chunk, or None if source is truly silent."""
+        if not self._started:
+            if self.q.qsize() >= self.PRE_BUFFER:
+                self._started = True
+            else:
+                return None
+
+        try:
+            data = self.q.get_nowait()
+            self._empty_streak = 0
+            self._last_chunk = data
+            return data
+        except queue.Empty:
+            self._empty_streak += 1
+            if self._empty_streak > self.STALE_LIMIT:
+                # Source truly stopped — reset for next burst
+                self._started = False
+                self._empty_streak = 0
+                self._last_chunk = None
+                return None
+            # Brief underrun — repeat the last chunk to fill the gap
+            return self._last_chunk
+
+
 class AudioManager:
-    """Thread-safe microphone capture and speaker playback."""
+    """Thread-safe microphone capture and speaker playback.
+
+    Incoming audio is tagged with an 8-byte source ID by the server.
+    Each source gets its own jitter buffer so consecutive chunks from
+    the *same* speaker play back-to-back, while chunks from
+    *different* speakers are summed (mixed) in the output callback.
+    """
+
+    SOURCE_TAG_LEN = 8          # bytes prepended by the server
 
     def __init__(self):
         self.is_capturing = False
-        self.on_audio_data = None          # callback(bytes), called from _send_loop
-        self._capture_q  = queue.Queue(maxsize=50)
-        self._playback_q = queue.Queue(maxsize=50)
-        self._running     = False
-        self._in_stream   = None
-        self._out_stream  = None
-        self._has_input   = True
+        self.on_audio_data = None          # callback(bytes)
+        self._capture_q    = queue.Queue(maxsize=50)
+        self._sources: dict[bytes, _SourceBuffer] = {}
+        self._sources_lock = threading.Lock()
+        self._running      = False
+        self._in_stream    = None
+        self._out_stream   = None
+        self._has_input    = True
 
     # -- lifecycle -----------------------------------------------------------
 
     def start(self):
         self._running = True
 
-        # Output (speakers) — should almost always succeed
         self._out_stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=AUDIO_CHANNELS,
@@ -190,7 +263,6 @@ class AudioManager:
         )
         self._out_stream.start()
 
-        # Input (microphone) — may fail if no mic is present
         try:
             self._in_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -220,7 +292,6 @@ class AudioManager:
     # -- sounddevice callbacks (PortAudio thread) ----------------------------
 
     def _in_cb(self, indata, frames, time_info, status):
-        """Always drain the mic buffer; only enqueue when PTT active."""
         if self.is_capturing:
             try:
                 self._capture_q.put_nowait(indata.tobytes())
@@ -228,16 +299,30 @@ class AudioManager:
                 pass
 
     def _out_cb(self, outdata, frames, time_info, status):
-        try:
-            data = self._playback_q.get_nowait()
-            arr = np.frombuffer(data, dtype=np.int16)
-            needed = frames * AUDIO_CHANNELS
-            if arr.size >= needed:
-                outdata[:, 0] = arr[:needed]
-            else:
-                outdata[:arr.size, 0] = arr
-                outdata[arr.size:] = 0
-        except queue.Empty:
+        """Take ONE chunk from each source's jitter buffer and mix.
+
+        Each _SourceBuffer holds back audio until PRE_BUFFER chunks
+        have accumulated, absorbing network jitter so playback is
+        smooth and continuous.
+        """
+        needed = frames * AUDIO_CHANNELS
+        mixed  = np.zeros(needed, dtype=np.float32)
+        count  = 0
+
+        with self._sources_lock:
+            buffers = list(self._sources.values())
+
+        for buf in buffers:
+            data = buf.get()
+            if data is not None:
+                arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                size = min(arr.size, needed)
+                mixed[:size] += arr[:size]
+                count += 1
+
+        if count:
+            outdata[:, 0] = np.clip(mixed, -32768, 32767).astype(np.int16)
+        else:
             outdata.fill(0)
 
     # -- send loop (own thread → network) ------------------------------------
@@ -252,27 +337,33 @@ class AudioManager:
             except queue.Empty:
                 pass
 
-    # -- called from network receive thread ----------------------------------
+    # -- called from network thread ------------------------------------------
 
     def enqueue_playback(self, raw: bytes):
-        try:
-            self._playback_q.put_nowait(raw)
-        except queue.Full:
-            try:
-                self._playback_q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._playback_q.put_nowait(raw)
-            except queue.Full:
-                pass
+        """Parse the 8-byte source tag and route to a per-source jitter buffer."""
+        if len(raw) <= self.SOURCE_TAG_LEN:
+            return
+        source_id = raw[:self.SOURCE_TAG_LEN]
+        audio     = raw[self.SOURCE_TAG_LEN:]
+
+        with self._sources_lock:
+            buf = self._sources.get(source_id)
+            if buf is None:
+                buf = _SourceBuffer()
+                self._sources[source_id] = buf
+
+        buf.put(audio)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NetworkManager — WebSocket client with Qt signals
+# NetworkManager — WebSocket signaling + WebRTC DataChannel
 # ═══════════════════════════════════════════════════════════════════════════
 class NetworkManager(QWidget):
-    """Thin Qt wrapper around a threaded websocket-client connection."""
+    """Manages signaling (WebSocket) and audio transport (WebRTC DC).
+
+    Runs an asyncio event loop in a background thread.  All heavy I/O
+    is non-blocking; the Qt main thread is never stalled.
+    """
 
     sig_welcome      = pyqtSignal(list)    # channel names
     sig_connected    = pyqtSignal()
@@ -284,76 +375,186 @@ class NetworkManager(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.hide()
-        self.ws  = None
+        self._ws      = None                # websockets connection
+        self._pc      = None                # RTCPeerConnection
+        self._dc      = None                # RTCDataChannel
+        self._loop    = None                # asyncio event loop
         self._thread  = None
         self._name    = ""
         self._address = ""
+        self._closing = False
 
     # -- public API ----------------------------------------------------------
 
     def connect_to(self, address: str, name: str):
         self._address = address
         self._name    = name
-        self._thread  = threading.Thread(target=self._run, daemon=True)
+        self._closing = False
+        self._thread  = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-    def send_json(self, obj):
-        try:
-            w = self.ws
-            if w and w.sock and w.sock.connected:
-                w.send(json.dumps(obj))
-        except Exception:
-            pass
+    def send_json(self, obj: dict):
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._ws_send(json.dumps(obj)), loop)
 
     def send_audio(self, raw: bytes):
+        """Called from the audio send-loop thread."""
+        loop = self._loop
+        if self._dc and loop and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._dc_send_sync, raw)
+            except RuntimeError:
+                pass   # loop already closed
+
+    def disconnect(self):
+        self._closing = True
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._close(), loop)
+
+    # -- asyncio background thread -------------------------------------------
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         try:
-            w = self.ws
-            if w and w.sock and w.sock.connected:
-                w.send(raw, opcode=websocket.ABNF.OPCODE_BINARY)
+            self._loop.run_until_complete(self._main_async())
+        except Exception as e:
+            if not self._closing:
+                self.sig_error.emit(str(e))
+        finally:
+            self.sig_disconnected.emit()
+            try:
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            self._loop.close()
+            self._loop = None
+
+    async def _main_async(self):
+        url = f"ws://{self._address}"
+        try:
+            async with websockets.connect(
+                url, max_size=2 ** 20, ping_interval=30, ping_timeout=10,
+            ) as ws:
+                self._ws = ws
+                await ws.send(json.dumps({
+                    "type": "set_name", "name": self._name,
+                }))
+                async for msg in ws:
+                    if isinstance(msg, str):
+                        await self._on_message(json.loads(msg))
+        except asyncio.CancelledError:
+            pass
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except ConnectionRefusedError:
+            if not self._closing:
+                self.sig_error.emit("Could not connect — is the server running?")
+        except Exception as e:
+            if not self._closing:
+                self.sig_error.emit(str(e))
+        finally:
+            if self._pc:
+                try:
+                    await self._pc.close()
+                except Exception:
+                    pass
+                self._pc = None
+                self._dc = None
+            self._ws = None
+
+    # -- signaling messages --------------------------------------------------
+
+    async def _on_message(self, data: dict):
+        t = data.get("type")
+
+        if t == "welcome":
+            self.sig_welcome.emit(data["channels"])
+            self.sig_connected.emit()
+            await self._setup_webrtc()
+
+        elif t == "user_list":
+            self.sig_user_list.emit(data["channels"])
+
+        elif t == "answer":
+            if self._pc:
+                ans = RTCSessionDescription(
+                    sdp=data["sdp"], type=data["sdp_type"],
+                )
+                await self._pc.setRemoteDescription(ans)
+
+    # -- WebRTC setup --------------------------------------------------------
+
+    async def _setup_webrtc(self):
+        self._pc = RTCPeerConnection()
+
+        # Unreliable + unordered DataChannel (UDP-like, ideal for audio)
+        self._dc = self._pc.createDataChannel(
+            "audio", ordered=False, maxRetransmits=0,
+        )
+
+        @self._dc.on("message")
+        def on_dc_message(message):
+            if isinstance(message, bytes):
+                self.sig_audio.emit(message)
+
+        @self._pc.on("connectionstatechange")
+        async def _on_rtc_state():
+            pass   # could add reconnect logic here
+
+        # Create and send SDP offer
+        offer = await self._pc.createOffer()
+        await self._pc.setLocalDescription(offer)
+
+        # Wait until all ICE candidates are gathered
+        if self._pc.iceGatheringState != "complete":
+            done = asyncio.Event()
+
+            @self._pc.on("icegatheringstatechange")
+            def _on_ice():
+                if self._pc and self._pc.iceGatheringState == "complete":
+                    done.set()
+
+            await asyncio.wait_for(done.wait(), timeout=30)
+
+        await self._ws.send(json.dumps({
+            "type": "offer",
+            "sdp": self._pc.localDescription.sdp,
+            "sdp_type": self._pc.localDescription.type,
+        }))
+
+    # -- internal helpers ----------------------------------------------------
+
+    async def _ws_send(self, text: str):
+        try:
+            if self._ws:
+                await self._ws.send(text)
         except Exception:
             pass
 
-    def disconnect(self):
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
+    def _dc_send_sync(self, data: bytes):
+        """Synchronous DC send — called via call_soon_threadsafe."""
+        try:
+            if self._dc and self._dc.readyState == "open":
+                self._dc.send(data)
+        except Exception:
+            pass
 
-    # -- background thread ---------------------------------------------------
-
-    def _run(self):
-        url = f"ws://{self._address}"
-        self.ws = websocket.WebSocketApp(
-            url,
-            on_open=self._on_open,
-            on_data=self._on_data,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        self.ws.run_forever(ping_interval=60, ping_timeout=20)
-
-    def _on_open(self, ws):
-        self.send_json({"type": "set_name", "name": self._name})
-        self.sig_connected.emit()
-
-    def _on_data(self, ws, data, data_type, cont):
-        if data_type == websocket.ABNF.OPCODE_TEXT:
-            text = data if isinstance(data, str) else data.decode("utf-8", errors="replace")
-            msg = json.loads(text)
-            t = msg.get("type")
-            if t == "welcome":
-                self.sig_welcome.emit(msg["channels"])
-            elif t == "user_list":
-                self.sig_user_list.emit(msg["channels"])
-        elif data_type == websocket.ABNF.OPCODE_BINARY:
-            self.sig_audio.emit(data)
-
-    def _on_error(self, ws, error):
-        self.sig_error.emit(str(error))
-
-    def _on_close(self, ws, code, msg):
-        self.sig_disconnected.emit()
+    async def _close(self):
+        try:
+            if self._pc:
+                await self._pc.close()
+                self._pc = None
+                self._dc = None
+        except Exception:
+            pass
+        try:
+            if self._ws:
+                await self._ws.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -695,7 +896,7 @@ class ChatPage(QWidget):
         for w in self._widgets:
             w.set_users(data.get(str(w.channel_id), []))
 
-    # -- open mic toggle -------------------------------------------------------
+    # -- open mic toggle -----------------------------------------------------
 
     def _toggle_open_mic(self, checked: bool):
         self._open_mic = checked
@@ -705,7 +906,6 @@ class ChatPage(QWidget):
                 "background-color: #a6e3a1; color: #1e1e2e; font-weight: bold;"
                 "border: none; border-radius: 8px; padding: 10px 24px;"
             )
-            # Disable PTT controls
             self._ptt_hdr.setStyleSheet("color: #45475a;")
             self._ptt_row_widget.setEnabled(False)
             self._ptt_status.setText("\u25cf  Open Mic")
@@ -715,7 +915,6 @@ class ChatPage(QWidget):
         else:
             self._open_mic_btn.setText("Open Mic: OFF")
             self._open_mic_btn.setStyleSheet("")
-            # Re-enable PTT controls
             self._ptt_hdr.setStyleSheet("")
             self._ptt_row_widget.setEnabled(True)
             self._ptt_status.setText("\u25cf  Muted")
@@ -724,7 +923,7 @@ class ChatPage(QWidget):
             self._ptt_status.style().polish(self._ptt_status)
         self.sig_open_mic.emit(checked)
 
-    # -- PTT key capture (uses Qt keyPressEvent, no external library) ---------
+    # -- PTT key capture (keyboard + mouse) ----------------------------------
 
     def _start_capture(self):
         self._ptt_btn.setEnabled(False)
@@ -735,7 +934,6 @@ class ChatPage(QWidget):
         self.grabMouse()
 
     def _finish_capture(self, vk: int):
-        """Common handler once a VK code is captured (keyboard or mouse)."""
         self._capturing_key = False
         self.releaseKeyboard()
         self.releaseMouse()
@@ -752,13 +950,12 @@ class ChatPage(QWidget):
         else:
             super().keyPressEvent(event)
 
-    # Qt mouse-button → Windows VK mapping
     _MOUSE_VK = {
-        Qt.LeftButton:    0x01,   # VK_LBUTTON
-        Qt.RightButton:   0x02,   # VK_RBUTTON
-        Qt.MiddleButton:  0x04,   # VK_MBUTTON
-        Qt.XButton1:      0x05,   # VK_XBUTTON1  (Mouse 4 / Back)
-        Qt.XButton2:      0x06,   # VK_XBUTTON2  (Mouse 5 / Forward)
+        Qt.LeftButton:    0x01,
+        Qt.RightButton:   0x02,
+        Qt.MiddleButton:  0x04,
+        Qt.XButton1:      0x05,   # Mouse 4 / Back
+        Qt.XButton2:      0x06,   # Mouse 5 / Forward
     }
 
     def mousePressEvent(self, event):
@@ -772,6 +969,8 @@ class ChatPage(QWidget):
     # -- PTT active indicator ------------------------------------------------
 
     def set_ptt_active(self, active: bool):
+        if self._open_mic:
+            return                     # don't override open-mic label
         if active:
             self._ptt_status.setText("\u25cf  Talking")
             self._ptt_status.setObjectName("status-talking")
@@ -800,14 +999,14 @@ class MainWindow(QMainWindow):
 
         self._audio = None
         self._net   = NetworkManager(self)
-        self._ptt_vk = None           # Windows virtual-key code
+        self._ptt_vk = None
         self._ptt_was_down = False
         self._open_mic = False
         self._username = ""
         self._channel_names: list[str] = []
         self._current_cid = None
 
-        # Timer that polls GetAsyncKeyState every 20 ms (global, works in background)
+        # Timer that polls GetAsyncKeyState every 20 ms
         self._ptt_timer = QTimer(self)
         self._ptt_timer.setInterval(20)
         self._ptt_timer.timeout.connect(self._poll_ptt)
@@ -825,7 +1024,7 @@ class MainWindow(QMainWindow):
 
         # Signals
         self._login.sig_connect.connect(self._do_connect)
-        self._net.sig_connected.connect(lambda: None)     # just acknowledge
+        self._net.sig_connected.connect(lambda: None)
         self._net.sig_welcome.connect(self._on_welcome)
         self._net.sig_disconnected.connect(self._on_disconnected)
         self._net.sig_error.connect(self._on_error)
@@ -870,7 +1069,6 @@ class MainWindow(QMainWindow):
     def _on_welcome(self, channels: list[str]):
         self._show_chat(channels)
 
-        # Start audio engine
         self._audio = AudioManager()
         try:
             self._audio.start()
@@ -885,7 +1083,7 @@ class MainWindow(QMainWindow):
         if self._audio and not self._audio._has_input:
             if self._chat:
                 self._chat.show_mic_warning(
-                    "No microphone detected — you can listen but not talk."
+                    "No microphone detected \u2014 you can listen but not talk."
                 )
 
     def _on_disconnected(self):
@@ -933,7 +1131,6 @@ class MainWindow(QMainWindow):
             self._ptt_timer.stop()
             self._ptt_was_down = False
         else:
-            # Revert to PTT mode; start polling if a key is set
             if self._audio:
                 self._audio.is_capturing = False
             if self._ptt_vk is not None:
@@ -948,7 +1145,6 @@ class MainWindow(QMainWindow):
             self._ptt_timer.start()
 
     def _poll_ptt(self):
-        """Called every 20 ms — check if the PTT key is physically held."""
         if self._ptt_vk is None or self._open_mic:
             return
         pressed = bool(_GetAsyncKeyState(self._ptt_vk) & 0x8000)
