@@ -59,3 +59,11 @@ client  ──WebSocket──▶  server  ──WebSocket──▶  other client
   channel and forwards audio binary frames to everyone else in the same channel.
 - **client.py** — PyQt5 desktop app. Uses `sounddevice` for audio I/O,
   `keyboard` for global PTT hotkey, and `websocket-client` for networking.
+
+
+
+
+# building exe file
+```python
+  python -m PyInstaller client.spec --clean 
+```
