@@ -24,6 +24,10 @@ import sounddevice as sd
 from aiortc import RTCPeerConnection, RTCSessionDescription
 import websockets
 
+
+from pyrnnoise import RNNoise as _RNNoise
+_HAS_RNNOISE = True
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QMessageBox,
@@ -227,6 +231,147 @@ class _SourceBuffer:
             return self._last_chunk
 
 
+class _AudioProcessor:
+    """Echo suppression  +  RNNoise neural denoiser.
+
+    *Echo suppression* — keeps a ring buffer of recent speaker output
+    (the *reference*) and uses power-spectral subtraction to remove
+    the speaker bleed that the microphone picks up.
+
+    *Noise suppression* — passes the result through **pyrnnoise**
+    (Xiph RNNoise, a recurrent neural network trained for real-time
+    speech denoising).  RNNoise operates at 48 kHz so we resample
+    16 kHz ↔ 48 kHz around it.
+
+    All processing runs in the send-loop thread, never in PortAudio.
+    """
+
+    _REF_BLOCKS = 10            # ~640 ms of reference history
+
+    def __init__(self, block_size: int = BLOCK_SIZE):
+        self.B = block_size
+
+        # ── Reference ring buffer (what the speakers played) ───────────
+        self._ref_ring = np.zeros(block_size * self._REF_BLOCKS, dtype=np.float64)
+        self._ref_wpos = 0
+        self._ref_lock = threading.Lock()
+
+        # Spectral-subtraction tuning
+        self._alpha = 4.0       # over-subtraction factor
+        self._beta  = 0.02      # spectral floor
+
+        # ── RNNoise (48 kHz) ──────────────────────────────────────────
+        self._denoiser = None
+        if _HAS_RNNOISE:
+            try:
+                self._denoiser = _RNNoise(sample_rate=48000)
+            except Exception:
+                pass
+
+    # -- called from _out_cb (must be fast) ------------------------------
+
+    def feed_reference(self, pcm_int16: np.ndarray):
+        """Record what the speakers just played."""
+        samples = pcm_int16.astype(np.float64)
+        n = len(samples)
+        with self._ref_lock:
+            ring_len = len(self._ref_ring)
+            end = self._ref_wpos + n
+            if end <= ring_len:
+                self._ref_ring[self._ref_wpos:end] = samples
+            else:
+                first = ring_len - self._ref_wpos
+                self._ref_ring[self._ref_wpos:] = samples[:first]
+                self._ref_ring[:n - first] = samples[first:]
+            self._ref_wpos = end % ring_len
+
+    # -- called from _send_loop thread -----------------------------------
+
+    def process(self, mic_bytes: bytes) -> bytes:
+        """Full chain: echo suppress → RNNoise denoise."""
+        data = self._echo_suppress(mic_bytes)
+        data = self._rnnoise(data)
+        return data
+
+    # ── echo suppression (spectral subtraction with reference) ─────────
+
+    def _echo_suppress(self, mic_bytes: bytes) -> bytes:
+        mic = np.frombuffer(mic_bytes, dtype=np.int16).astype(np.float64)
+
+        with self._ref_lock:
+            ref_all = self._ref_ring.copy()
+
+        ref_energy = np.sqrt(np.mean(ref_all ** 2))
+        if ref_energy < 30:
+            return mic_bytes                       # speakers are silent
+
+        mic_energy = np.sqrt(np.mean(mic ** 2))
+        if mic_energy > ref_energy * 3.0:
+            return mic_bytes                       # user is clearly talking
+
+        # Build max power spectrum across recent reference blocks
+        n_fft = len(mic)
+        R_pow = np.zeros(n_fft // 2 + 1, dtype=np.float64)
+        ring_len = len(ref_all)
+        for i in range(self._REF_BLOCKS):
+            start = ring_len - (i + 1) * self.B
+            if start < 0:
+                break
+            block = ref_all[start:start + self.B]
+            if len(block) == n_fft:
+                R_pow = np.maximum(R_pow, np.abs(np.fft.rfft(block)) ** 2)
+
+        M       = np.fft.rfft(mic)
+        M_mag2  = np.abs(M) ** 2
+        M_phase = np.angle(M)
+
+        clean_mag2 = np.maximum(M_mag2 - self._alpha * R_pow,
+                                self._beta * M_mag2)
+
+        out = np.fft.irfft(np.sqrt(clean_mag2) * np.exp(1j * M_phase))[:n_fft]
+        return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+
+    # ── RNNoise neural denoiser (48 kHz) ───────────────────────────────
+
+    def _rnnoise(self, pcm_bytes: bytes) -> bytes:
+        if self._denoiser is None:
+            return pcm_bytes
+
+        audio_16k = np.frombuffer(pcm_bytes, dtype=np.int16)
+        n = len(audio_16k)
+
+        # Upsample 16 kHz → 48 kHz (clean 1:3 ratio)
+        audio_48k = np.interp(
+            np.linspace(0, n - 1, n * 3),
+            np.arange(n),
+            audio_16k.astype(np.float64),
+        ).astype(np.int16)
+
+        # RNNoise expects [channels, samples] int16
+        try:
+            denoised_parts: list[np.ndarray] = []
+            for _prob, frame in self._denoiser.denoise_chunk(
+                audio_48k.reshape(1, -1), partial=True,
+            ):
+                denoised_parts.append(frame.flatten())
+        except Exception:
+            return pcm_bytes
+
+        if not denoised_parts:
+            return pcm_bytes
+
+        denoised_48k = np.concatenate(denoised_parts).astype(np.float64)
+
+        # Downsample 48 kHz → 16 kHz
+        denoised_16k = np.interp(
+            np.linspace(0, len(denoised_48k) - 1, n),
+            np.arange(len(denoised_48k)),
+            denoised_48k,
+        ).astype(np.int16)
+
+        return denoised_16k.tobytes()
+
+
 class AudioManager:
     """Thread-safe microphone capture and speaker playback.
 
@@ -234,6 +379,10 @@ class AudioManager:
     Each source gets its own jitter buffer so consecutive chunks from
     the *same* speaker play back-to-back, while chunks from
     *different* speakers are summed (mixed) in the output callback.
+
+    An ``_AudioProcessor`` handles echo suppression (spectral
+    subtraction with speaker reference) and noise suppression
+    (RNNoise neural network via ``pyrnnoise``).
     """
 
     SOURCE_TAG_LEN = 8          # bytes prepended by the server
@@ -248,6 +397,7 @@ class AudioManager:
         self._in_stream    = None
         self._out_stream   = None
         self._has_input    = True
+        self._proc         = _AudioProcessor(BLOCK_SIZE)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -321,7 +471,10 @@ class AudioManager:
                 count += 1
 
         if count:
-            outdata[:, 0] = np.clip(mixed, -32768, 32767).astype(np.int16)
+            out_samples = np.clip(mixed, -32768, 32767).astype(np.int16)
+            outdata[:, 0] = out_samples
+            # Record speaker output for echo suppression
+            self._proc.feed_reference(out_samples)
         else:
             outdata.fill(0)
 
@@ -331,6 +484,8 @@ class AudioManager:
         while self._running:
             try:
                 data = self._capture_q.get(timeout=0.05)
+                # Echo suppress → RNNoise denoise → send
+                data = self._proc.process(data)
                 cb = self.on_audio_data
                 if cb:
                     cb(data)
