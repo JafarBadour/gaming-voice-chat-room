@@ -25,8 +25,19 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 import websockets
 
 
-from pyrnnoise import RNNoise as _RNNoise
-_HAS_RNNOISE = True
+try:
+    from aec_audio_processing import AudioProcessor as _WebRTCAP
+    _HAS_AEC = True
+except ImportError:
+    _WebRTCAP = None
+    _HAS_AEC = False
+
+try:
+    from pyrnnoise import RNNoise as _RNNoise
+    _HAS_RNNOISE = True
+except ImportError:
+    _RNNoise = None
+    _HAS_RNNOISE = False
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -82,9 +93,9 @@ def _vk_name(vk: int) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Audio configuration
 # ═══════════════════════════════════════════════════════════════════════════
-SAMPLE_RATE    = 16000
+SAMPLE_RATE    = 48000
 AUDIO_CHANNELS = 1
-BLOCK_SIZE     = 1024        # ~64 ms at 16 kHz
+BLOCK_SIZE     = 960         # 20 ms at 48 kHz (= 2 × 480 RNNoise/AEC frames)
 DTYPE          = "int16"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -180,15 +191,15 @@ class _SourceBuffer:
 
     Accumulates PRE_BUFFER chunks before starting playback.
     If the buffer briefly runs dry (network jitter), the last
-    known chunk is *repeated* instead of outputting silence,
-    which sounds like a tiny sustain rather than a hard cut.
+    known chunk is faded out quickly (over ~2 chunks ≈ 128 ms)
+    rather than repeated at full volume or cut to hard silence.
     """
 
-    PRE_BUFFER  = 5             # chunks to buffer before playing (~320 ms)
-    STALE_LIMIT = 50            # consecutive empty reads before resetting
+    PRE_BUFFER   = 15           # chunks to buffer before playing (~300 ms)
+    FADE_CHUNKS  = 4            # underrun fade-out chunks (~80 ms)
 
     def __init__(self):
-        self.q = queue.Queue(maxsize=60)
+        self.q = queue.Queue(maxsize=150)
         self._started = False
         self._empty_streak = 0
         self._last_chunk: bytes | None = None
@@ -221,155 +232,147 @@ class _SourceBuffer:
             return data
         except queue.Empty:
             self._empty_streak += 1
-            if self._empty_streak > self.STALE_LIMIT:
-                # Source truly stopped — reset for next burst
+            if self._empty_streak > self.FADE_CHUNKS or self._last_chunk is None:
+                # Sender stopped — reset for next burst
                 self._started = False
                 self._empty_streak = 0
                 self._last_chunk = None
                 return None
-            # Brief underrun — repeat the last chunk to fill the gap
-            return self._last_chunk
+            # Brief underrun — return a quickly fading version of the
+            # last chunk so the tail doesn't repeat at full volume.
+            fade = 1.0 / (2 ** self._empty_streak)     # 0.5, 0.25, …
+            samples = np.frombuffer(self._last_chunk, dtype=np.int16)
+            faded = (samples.astype(np.float32) * fade).astype(np.int16)
+            return faded.tobytes()
 
 
 class _AudioProcessor:
-    """Echo suppression  +  RNNoise neural denoiser.
+    """WebRTC AEC  +  RNNoise noise suppression.
 
-    *Echo suppression* — keeps a ring buffer of recent speaker output
-    (the *reference*) and uses power-spectral subtraction to remove
-    the speaker bleed that the microphone picks up.
+    Two dedicated libraries, each used for what it does best:
 
-    *Noise suppression* — passes the result through **pyrnnoise**
-    (Xiph RNNoise, a recurrent neural network trained for real-time
-    speech denoising).  RNNoise operates at 48 kHz so we resample
-    16 kHz ↔ 48 kHz around it.
+    * **WebRTC AEC** (``aec-audio-processing``) — real adaptive-filter
+      echo cancellation.  AGC and NS are disabled (AGC was boosting
+      noise; WebRTC NS targets stationary noise, not keyboard clicks).
 
-    All processing runs in the send-loop thread, never in PortAudio.
+    * **RNNoise** (``pyrnnoise``) — neural-network denoiser trained on
+      non-speech transient sounds (keyboard, mouse, breathing, …).
+
+    Pipeline:  mic → WebRTC AEC → RNNoise → network
+
+    At 48 kHz with BLOCK_SIZE = 960, both WebRTC AEC (480-sample /
+    10 ms frames) and RNNoise (480-sample frames) divide evenly into
+    each block — no carry buffers, no resampling, no variable output.
     """
 
-    _REF_BLOCKS = 10            # ~640 ms of reference history
+    _FRAME = 480               # 10 ms @ 48 kHz
 
     def __init__(self, block_size: int = BLOCK_SIZE):
         self.B = block_size
+        self.enabled = True    # toggled from the UI
 
-        # ── Reference ring buffer (what the speakers played) ───────────
-        self._ref_ring = np.zeros(block_size * self._REF_BLOCKS, dtype=np.float64)
-        self._ref_wpos = 0
-        self._ref_lock = threading.Lock()
+        # ── WebRTC AEC (echo cancellation only) ──────────────────────
+        self._ap = None
+        self._ref_q: queue.Queue = queue.Queue(maxsize=200)
 
-        # Spectral-subtraction tuning
-        self._alpha = 4.0       # over-subtraction factor
-        self._beta  = 0.02      # spectral floor
+        if _HAS_AEC:
+            try:
+                self._ap = _WebRTCAP(
+                    enable_aec=True,
+                    enable_ns=False,     # leave NS to RNNoise
+                    enable_agc=False,    # no auto-gain
+                )
+                self._ap.set_stream_format(SAMPLE_RATE, AUDIO_CHANNELS)
+                self._ap.set_reverse_stream_format(SAMPLE_RATE, AUDIO_CHANNELS)
+                self._ap.set_stream_delay(40)
+            except Exception:
+                self._ap = None
 
-        # ── RNNoise (48 kHz) ──────────────────────────────────────────
+        # ── RNNoise (keyboard / mouse / noise suppression) ───────────
         self._denoiser = None
         if _HAS_RNNOISE:
             try:
-                self._denoiser = _RNNoise(sample_rate=48000)
+                # 48 kHz = RNNoise native rate → zero resampling
+                self._denoiser = _RNNoise(sample_rate=SAMPLE_RATE)
             except Exception:
-                pass
+                self._denoiser = None
 
-    # -- called from _out_cb (must be fast) ------------------------------
+    # -- called from _out_cb (must be fast) --------------------------------
 
     def feed_reference(self, pcm_int16: np.ndarray):
-        """Record what the speakers just played."""
-        samples = pcm_int16.astype(np.float64)
-        n = len(samples)
-        with self._ref_lock:
-            ring_len = len(self._ref_ring)
-            end = self._ref_wpos + n
-            if end <= ring_len:
-                self._ref_ring[self._ref_wpos:end] = samples
-            else:
-                first = ring_len - self._ref_wpos
-                self._ref_ring[self._ref_wpos:] = samples[:first]
-                self._ref_ring[:n - first] = samples[first:]
-            self._ref_wpos = end % ring_len
+        """Queue speaker output so the AEC can subtract it later."""
+        if self._ap is None or not self.enabled:
+            return
+        try:
+            self._ref_q.put_nowait(pcm_int16.astype(np.int16).copy())
+        except queue.Full:
+            pass
 
-    # -- called from _send_loop thread -----------------------------------
+    # -- called from _send_loop thread -------------------------------------
 
     def process(self, mic_bytes: bytes) -> bytes:
-        """Full chain: echo suppress → RNNoise denoise."""
-        data = self._echo_suppress(mic_bytes)
+        if not self.enabled:
+            return mic_bytes
+        data = self._aec(mic_bytes)
         data = self._rnnoise(data)
         return data
 
-    # ── echo suppression (spectral subtraction with reference) ─────────
+    # ── WebRTC AEC ────────────────────────────────────────────────────
 
-    def _echo_suppress(self, mic_bytes: bytes) -> bytes:
-        mic = np.frombuffer(mic_bytes, dtype=np.int16).astype(np.float64)
+    def _aec(self, mic_bytes: bytes) -> bytes:
+        """Remove echo using WebRTC's adaptive-filter AEC."""
+        if self._ap is None:
+            return mic_bytes
 
-        with self._ref_lock:
-            ref_all = self._ref_ring.copy()
+        F = self._FRAME
 
-        ref_energy = np.sqrt(np.mean(ref_all ** 2))
-        if ref_energy < 30:
-            return mic_bytes                       # speakers are silent
-
-        mic_energy = np.sqrt(np.mean(mic ** 2))
-        if mic_energy > ref_energy * 3.0:
-            return mic_bytes                       # user is clearly talking
-
-        # Build max power spectrum across recent reference blocks
-        n_fft = len(mic)
-        R_pow = np.zeros(n_fft // 2 + 1, dtype=np.float64)
-        ring_len = len(ref_all)
-        for i in range(self._REF_BLOCKS):
-            start = ring_len - (i + 1) * self.B
-            if start < 0:
+        # 1. Drain reference queue → feed reverse stream
+        while True:
+            try:
+                ref = self._ref_q.get_nowait()
+            except queue.Empty:
                 break
-            block = ref_all[start:start + self.B]
-            if len(block) == n_fft:
-                R_pow = np.maximum(R_pow, np.abs(np.fft.rfft(block)) ** 2)
+            # 960 / 480 = 2 frames exactly — no remainder
+            for i in range(0, len(ref), F):
+                try:
+                    self._ap.process_reverse_stream(
+                        ref[i:i + F].tobytes())
+                except Exception:
+                    pass
 
-        M       = np.fft.rfft(mic)
-        M_mag2  = np.abs(M) ** 2
-        M_phase = np.angle(M)
+        # 2. Process mic in 480-sample (10 ms) frames
+        audio = np.frombuffer(mic_bytes, dtype=np.int16)
+        parts: list[np.ndarray] = []
+        for i in range(0, len(audio), F):
+            try:
+                out = self._ap.process_stream(audio[i:i + F].tobytes())
+                parts.append(np.frombuffer(out, dtype=np.int16))
+            except Exception:
+                parts.append(audio[i:i + F])
 
-        clean_mag2 = np.maximum(M_mag2 - self._alpha * R_pow,
-                                self._beta * M_mag2)
+        return np.concatenate(parts).tobytes()
 
-        out = np.fft.irfft(np.sqrt(clean_mag2) * np.exp(1j * M_phase))[:n_fft]
-        return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
-
-    # ── RNNoise neural denoiser (48 kHz) ───────────────────────────────
+    # ── RNNoise (keyboard / mouse / background noise) ─────────────────
 
     def _rnnoise(self, pcm_bytes: bytes) -> bytes:
+        """Remove keyboard, mouse, and background noise via RNNoise."""
         if self._denoiser is None:
             return pcm_bytes
 
-        audio_16k = np.frombuffer(pcm_bytes, dtype=np.int16)
-        n = len(audio_16k)
-
-        # Upsample 16 kHz → 48 kHz (clean 1:3 ratio)
-        audio_48k = np.interp(
-            np.linspace(0, n - 1, n * 3),
-            np.arange(n),
-            audio_16k.astype(np.float64),
-        ).astype(np.int16)
-
-        # RNNoise expects [channels, samples] int16
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+        # 960 / 480 = 2 frames exactly at native 48 kHz — no resampling
         try:
-            denoised_parts: list[np.ndarray] = []
+            parts: list[np.ndarray] = []
             for _prob, frame in self._denoiser.denoise_chunk(
-                audio_48k.reshape(1, -1), partial=True,
+                audio.reshape(1, -1), partial=False,
             ):
-                denoised_parts.append(frame.flatten())
+                parts.append(frame.flatten())
         except Exception:
             return pcm_bytes
 
-        if not denoised_parts:
+        if not parts:
             return pcm_bytes
-
-        denoised_48k = np.concatenate(denoised_parts).astype(np.float64)
-
-        # Downsample 48 kHz → 16 kHz
-        denoised_16k = np.interp(
-            np.linspace(0, len(denoised_48k) - 1, n),
-            np.arange(len(denoised_48k)),
-            denoised_48k,
-        ).astype(np.int16)
-
-        return denoised_16k.tobytes()
+        return np.concatenate(parts).astype(np.int16).tobytes()
 
 
 class AudioManager:
@@ -380,9 +383,8 @@ class AudioManager:
     the *same* speaker play back-to-back, while chunks from
     *different* speakers are summed (mixed) in the output callback.
 
-    An ``_AudioProcessor`` handles echo suppression (spectral
-    subtraction with speaker reference) and noise suppression
-    (RNNoise neural network via ``pyrnnoise``).
+    An ``_AudioProcessor`` chains WebRTC AEC (echo cancellation)
+    with RNNoise (keyboard / mouse / noise suppression).
     """
 
     SOURCE_TAG_LEN = 8          # bytes prepended by the server
@@ -484,7 +486,7 @@ class AudioManager:
         while self._running:
             try:
                 data = self._capture_q.get(timeout=0.05)
-                # Echo suppress → RNNoise denoise → send
+                # WebRTC AEC + NS + AGC → send
                 data = self._proc.process(data)
                 cb = self.on_audio_data
                 if cb:
@@ -885,6 +887,7 @@ class ChatPage(QWidget):
     sig_disconnect     = pyqtSignal()
     sig_ptt_changed    = pyqtSignal(int)    # emits the VK code
     sig_open_mic       = pyqtSignal(bool)   # True = open mic on
+    sig_noise_suppress = pyqtSignal(bool)   # True = echo/noise suppression on
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -997,6 +1000,23 @@ class ChatPage(QWidget):
         self._mic_hint.hide()
         rl.addWidget(self._mic_hint)
 
+        rl.addWidget(self._sep())
+
+        ns_hdr = QLabel("NOISE SUPPRESSION")
+        ns_hdr.setObjectName("section")
+        rl.addWidget(ns_hdr)
+
+        self._ns_btn = QPushButton("Noise Suppression: ON")
+        self._ns_btn.setObjectName("secondary")
+        self._ns_btn.setCheckable(True)
+        self._ns_btn.setChecked(True)          # enabled by default
+        self._ns_btn.setStyleSheet(
+            "background-color: #a6e3a1; color: #1e1e2e; font-weight: bold;"
+            "border: none; border-radius: 8px; padding: 10px 24px;"
+        )
+        self._ns_btn.clicked.connect(self._toggle_noise_suppress)
+        rl.addWidget(self._ns_btn)
+
         rl.addStretch()
 
         btn_row = QHBoxLayout()
@@ -1077,6 +1097,20 @@ class ChatPage(QWidget):
             self._ptt_status.style().unpolish(self._ptt_status)
             self._ptt_status.style().polish(self._ptt_status)
         self.sig_open_mic.emit(checked)
+
+    # -- noise suppression toggle --------------------------------------------
+
+    def _toggle_noise_suppress(self, checked: bool):
+        if checked:
+            self._ns_btn.setText("Noise Suppression: ON")
+            self._ns_btn.setStyleSheet(
+                "background-color: #a6e3a1; color: #1e1e2e; font-weight: bold;"
+                "border: none; border-radius: 8px; padding: 10px 24px;"
+            )
+        else:
+            self._ns_btn.setText("Noise Suppression: OFF")
+            self._ns_btn.setStyleSheet("")
+        self.sig_noise_suppress.emit(checked)
 
     # -- PTT key capture (keyboard + mouse) ----------------------------------
 
@@ -1166,6 +1200,12 @@ class MainWindow(QMainWindow):
         self._ptt_timer.setInterval(20)
         self._ptt_timer.timeout.connect(self._poll_ptt)
 
+        # Delayed mute on PTT release (500 ms tail so words aren't clipped)
+        self._ptt_release_timer = QTimer(self)
+        self._ptt_release_timer.setSingleShot(True)
+        self._ptt_release_timer.setInterval(500)
+        self._ptt_release_timer.timeout.connect(self._ptt_release_fire)
+
         # Central stacked area
         self._container = QWidget()
         self._layout    = QVBoxLayout(self._container)
@@ -1212,6 +1252,7 @@ class MainWindow(QMainWindow):
         self._chat.sig_disconnect.connect(self._disconnect)
         self._chat.sig_ptt_changed.connect(self._set_ptt_key)
         self._chat.sig_open_mic.connect(self._set_open_mic)
+        self._chat.sig_noise_suppress.connect(self._set_noise_suppress)
         self._layout.addWidget(self._chat)
         self._chat.show()
 
@@ -1276,10 +1317,17 @@ class MainWindow(QMainWindow):
         if self._audio:
             self._audio.enqueue_playback(data)
 
+    # ── noise suppression ──────────────────────────────────────────────────
+
+    def _set_noise_suppress(self, enabled: bool):
+        if self._audio:
+            self._audio._proc.enabled = enabled
+
     # ── PTT ────────────────────────────────────────────────────────────────
 
     def _set_open_mic(self, enabled: bool):
         self._open_mic = enabled
+        self._ptt_release_timer.stop()
         if self._audio:
             self._audio.is_capturing = enabled
         if enabled:
@@ -1305,14 +1353,23 @@ class MainWindow(QMainWindow):
         pressed = bool(_GetAsyncKeyState(self._ptt_vk) & 0x8000)
         if pressed and not self._ptt_was_down:
             self._ptt_was_down = True
+            self._ptt_release_timer.stop()   # cancel pending mute
             if self._audio:
                 self._audio.is_capturing = True
             self._ptt_signal.emit(True)
         elif not pressed and self._ptt_was_down:
             self._ptt_was_down = False
-            if self._audio:
-                self._audio.is_capturing = False
-            self._ptt_signal.emit(False)
+            # Keep mic open for 500 ms so the tail of the sentence
+            # isn't clipped.  _ptt_release_fire() does the actual mute.
+            self._ptt_release_timer.start()
+
+    def _ptt_release_fire(self):
+        """Called 500 ms after PTT key was released."""
+        if self._ptt_was_down:
+            return                             # re-pressed before timeout
+        if self._audio:
+            self._audio.is_capturing = False
+        self._ptt_signal.emit(False)
 
     def _on_ptt(self, active: bool):
         if self._chat:
@@ -1322,6 +1379,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup(self):
         self._ptt_timer.stop()
+        self._ptt_release_timer.stop()
         if self._audio:
             self._audio.is_capturing = False
             self._audio.stop()

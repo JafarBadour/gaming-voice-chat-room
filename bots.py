@@ -26,8 +26,8 @@ import websockets
 # ---------------------------------------------------------------------------
 # Config (must match server / client)
 # ---------------------------------------------------------------------------
-SAMPLE_RATE = 16000
-BLOCK_SIZE  = 1024      # samples per chunk (~64 ms)
+SAMPLE_RATE = 48000
+BLOCK_SIZE  = 960       # samples per chunk (20 ms at 48 kHz)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,10 +100,10 @@ VOICES = [
 
 
 # ---------------------------------------------------------------------------
-# TTS → raw 16 kHz mono int16 PCM
+# TTS → raw mono int16 PCM at SAMPLE_RATE
 # ---------------------------------------------------------------------------
 async def tts_to_pcm(text: str, voice: str) -> np.ndarray:
-    """Convert text to 16 kHz mono int16 PCM using Edge TTS + PyAV.
+    """Convert text to mono int16 PCM at SAMPLE_RATE using Edge TTS + PyAV.
 
     Note: edge_tts is a client for Microsoft's cloud TTS (Text To Speech)
     service. The audio synthesis is performed on Microsoft's servers,
@@ -145,7 +145,7 @@ async def generate_voice_clips(voice_def: dict) -> list[np.ndarray]:
 # Load audio files from a directory (ogg / wav / mp3 / flac / …)
 # ---------------------------------------------------------------------------
 def load_audio_file(path: str) -> np.ndarray:
-    """Decode any audio file to 16 kHz mono int16 PCM via PyAV."""
+    """Decode any audio file to mono int16 PCM at SAMPLE_RATE via PyAV."""
     import av
 
     container = av.open(path)
