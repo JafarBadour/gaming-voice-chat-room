@@ -12,9 +12,12 @@ Run:
 
 import sys
 import json
+import logging
 import threading
 import queue
 import asyncio
+import traceback
+import time
 
 import ctypes
 import ctypes.wintypes
@@ -38,6 +41,22 @@ try:
 except ImportError:
     _RNNoise = None
     _HAS_RNNOISE = False
+
+# ---------------------------------------------------------------------------
+# Client-side logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  [%(levelname)s]  %(name)-12s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("client")
+
+# Quiet down noisy third-party loggers
+for _quiet in ("aioice", "aiortc", "aiortc.rtcpeerconnection",
+               "aiortc.rtcdtlstransport", "aiortc.rtcicetransport",
+               "websockets"):
+    logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -520,13 +539,21 @@ class NetworkManager(QWidget):
 
     Runs an asyncio event loop in a background thread.  All heavy I/O
     is non-blocking; the Qt main thread is never stalled.
+
+    If the connection drops unexpectedly, the manager will automatically
+    retry up to MAX_RECONNECT_ATTEMPTS times with exponential backoff.
     """
+
+    MAX_RECONNECT_ATTEMPTS = 5
+    RECONNECT_BASE_DELAY   = 2      # seconds — doubles each attempt
 
     sig_welcome      = pyqtSignal(list)    # channel names
     sig_connected    = pyqtSignal()
+    sig_reconnecting = pyqtSignal(int)     # attempt number
     sig_disconnected = pyqtSignal()
     sig_error        = pyqtSignal(str)
     sig_user_list    = pyqtSignal(dict)    # {str(cid): [names]}
+    sig_speaking     = pyqtSignal(dict)    # {str(cid): [names currently speaking]}
     sig_audio        = pyqtSignal(bytes)
 
     def __init__(self, parent=None):
@@ -540,6 +567,8 @@ class NetworkManager(QWidget):
         self._name    = ""
         self._address = ""
         self._closing = False
+        self._dc_send_errors = 0
+        self._last_channel_id = None        # remember for reconnection
 
     # -- public API ----------------------------------------------------------
 
@@ -554,6 +583,11 @@ class NetworkManager(QWidget):
         loop = self._loop
         if loop and loop.is_running():
             asyncio.run_coroutine_threadsafe(self._ws_send(json.dumps(obj)), loop)
+        # Track channel for reconnection
+        if obj.get("type") == "join_channel":
+            self._last_channel_id = obj.get("channel_id")
+        elif obj.get("type") == "leave_channel":
+            self._last_channel_id = None
 
     def send_audio(self, raw: bytes):
         """Called from the audio send-loop thread."""
@@ -565,6 +599,7 @@ class NetworkManager(QWidget):
                 pass   # loop already closed
 
     def disconnect(self):
+        log.info("Disconnect requested by user")
         self._closing = True
         loop = self._loop
         if loop and loop.is_running():
@@ -579,6 +614,7 @@ class NetworkManager(QWidget):
             self._loop.run_until_complete(self._main_async())
         except Exception as e:
             if not self._closing:
+                log.error("Event loop crashed: %s\n%s", e, traceback.format_exc())
                 self.sig_error.emit(str(e))
         finally:
             self.sig_disconnected.emit()
@@ -590,67 +626,149 @@ class NetworkManager(QWidget):
             self._loop = None
 
     async def _main_async(self):
+        attempt = 0
+
+        while not self._closing:
+            disconnect_reason = "unknown"
+            try:
+                await self._connect_once()
+                # If _connect_once returns normally (clean close), don't retry
+                if self._closing:
+                    return
+                disconnect_reason = "clean close"
+            except asyncio.CancelledError:
+                return
+            except ConnectionRefusedError:
+                if not self._closing:
+                    self.sig_error.emit("Could not connect — is the server running?")
+                return
+            except websockets.exceptions.ConnectionClosedOK:
+                disconnect_reason = "server closed cleanly"
+                log.info("Server closed connection cleanly")
+                if self._closing:
+                    return
+            except websockets.exceptions.ConnectionClosedError as e:
+                disconnect_reason = f"connection lost (code={e.code} reason={e.reason!r})"
+                log.warning("Connection lost: code=%s reason=%s", e.code, e.reason)
+            except websockets.exceptions.ConnectionClosed as e:
+                disconnect_reason = f"connection closed (code={e.code})"
+                log.warning("Connection closed: code=%s", e.code)
+            except OSError as e:
+                disconnect_reason = f"network error: {e}"
+                log.warning("Network error: %s", e)
+            except Exception as e:
+                disconnect_reason = f"unexpected: {e}"
+                log.error("Unexpected connection error: %s\n%s", e, traceback.format_exc())
+            finally:
+                # Always clean up WebRTC
+                if self._pc:
+                    try:
+                        await self._pc.close()
+                    except Exception as e:
+                        log.debug("Error closing PC: %s", e)
+                    self._pc = None
+                    self._dc = None
+                self._ws = None
+
+            if self._closing:
+                return
+
+            # Reconnection with exponential backoff
+            attempt += 1
+            if attempt > self.MAX_RECONNECT_ATTEMPTS:
+                log.error("Giving up after %d reconnection attempts (last: %s)",
+                          attempt - 1, disconnect_reason)
+                self.sig_error.emit(
+                    f"Lost connection ({disconnect_reason}). "
+                    f"Gave up after {attempt - 1} retries.")
+                return
+
+            delay = self.RECONNECT_BASE_DELAY * (2 ** (attempt - 1))
+            delay = min(delay, 30)  # cap at 30s
+            log.info("Reconnecting in %.0fs (attempt %d/%d, reason: %s)",
+                     delay, attempt, self.MAX_RECONNECT_ATTEMPTS, disconnect_reason)
+            self.sig_reconnecting.emit(attempt)
+            await asyncio.sleep(delay)
+
+    async def _connect_once(self):
+        """Single connection attempt — run until disconnected or error."""
         url = f"ws://{self._address}"
-        try:
-            async with websockets.connect(
-                url, max_size=2 ** 20, ping_interval=30, ping_timeout=10,
-            ) as ws:
-                self._ws = ws
-                await ws.send(json.dumps({
-                    "type": "set_name", "name": self._name,
-                }))
-                async for msg in ws:
-                    if isinstance(msg, str):
+        log.info("Connecting to %s ...", url)
+
+        async with websockets.connect(
+            url,
+            max_size=2 ** 20,
+            ping_interval=30,
+            ping_timeout=30,      # match server — generous for gaming
+        ) as ws:
+            self._ws = ws
+            log.info("WebSocket connected to %s", url)
+
+            await ws.send(json.dumps({
+                "type": "set_name", "name": self._name,
+            }))
+
+            async for msg in ws:
+                if isinstance(msg, str):
+                    try:
                         await self._on_message(json.loads(msg))
-        except asyncio.CancelledError:
-            pass
-        except websockets.exceptions.ConnectionClosed:
-            pass
-        except ConnectionRefusedError:
-            if not self._closing:
-                self.sig_error.emit("Could not connect — is the server running?")
-        except Exception as e:
-            if not self._closing:
-                self.sig_error.emit(str(e))
-        finally:
-            if self._pc:
-                try:
-                    await self._pc.close()
-                except Exception:
-                    pass
-                self._pc = None
-                self._dc = None
-            self._ws = None
+                    except Exception:
+                        log.error("Error handling message: %s\n%s",
+                                  msg[:200], traceback.format_exc())
 
     # -- signaling messages --------------------------------------------------
 
     async def _on_message(self, data: dict):
         t = data.get("type")
+        log.debug("WS recv: %s", t)
 
         if t == "welcome":
             self.sig_welcome.emit(data["channels"])
             self.sig_connected.emit()
             await self._setup_webrtc()
+            # Re-join channel if this is a reconnection
+            if self._last_channel_id is not None:
+                log.info("Re-joining channel %d after reconnect", self._last_channel_id)
+                await self._ws_send(json.dumps({
+                    "type": "join_channel",
+                    "channel_id": self._last_channel_id,
+                }))
 
         elif t == "user_list":
             self.sig_user_list.emit(data["channels"])
 
+        elif t == "speaking":
+            self.sig_speaking.emit(data.get("speakers", {}))
+
         elif t == "answer":
             if self._pc:
+                log.info("SDP answer received, setting remote description")
                 ans = RTCSessionDescription(
                     sdp=data["sdp"], type=data["sdp_type"],
                 )
                 await self._pc.setRemoteDescription(ans)
+        else:
+            log.debug("Unknown message type: %s", t)
 
     # -- WebRTC setup --------------------------------------------------------
 
     async def _setup_webrtc(self):
+        log.info("Setting up WebRTC PeerConnection")
         self._pc = RTCPeerConnection()
+        self._dc_send_errors = 0
 
         # Unreliable + unordered DataChannel (UDP-like, ideal for audio)
         self._dc = self._pc.createDataChannel(
             "audio", ordered=False, maxRetransmits=0,
         )
+
+        @self._dc.on("open")
+        def on_dc_open():
+            log.info("DataChannel OPEN")
+
+        @self._dc.on("close")
+        def on_dc_close():
+            log.warning("DataChannel CLOSED")
 
         @self._dc.on("message")
         def on_dc_message(message):
@@ -659,11 +777,22 @@ class NetworkManager(QWidget):
 
         @self._pc.on("connectionstatechange")
         async def _on_rtc_state():
-            pass   # could add reconnect logic here
+            state = self._pc.connectionState if self._pc else "?"
+            log.info("WebRTC state: %s", state)
+            if state == "failed":
+                log.error("WebRTC connection FAILED — likely network/firewall issue")
+            elif state == "disconnected":
+                log.warning("WebRTC DISCONNECTED — may recover automatically")
+
+        @self._pc.on("iceconnectionstatechange")
+        async def _on_ice_conn():
+            state = self._pc.iceConnectionState if self._pc else "?"
+            log.debug("ICE connection state: %s", state)
 
         # Create and send SDP offer
         offer = await self._pc.createOffer()
         await self._pc.setLocalDescription(offer)
+        log.info("SDP offer created, gathering ICE candidates...")
 
         # Wait until all ICE candidates are gathered
         if self._pc.iceGatheringState != "complete":
@@ -671,11 +800,18 @@ class NetworkManager(QWidget):
 
             @self._pc.on("icegatheringstatechange")
             def _on_ice():
+                log.debug("ICE gathering: %s",
+                          self._pc.iceGatheringState if self._pc else "?")
                 if self._pc and self._pc.iceGatheringState == "complete":
                     done.set()
 
-            await asyncio.wait_for(done.wait(), timeout=30)
+            try:
+                await asyncio.wait_for(done.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                log.error("ICE gathering timed out after 30s")
+                raise
 
+        log.info("ICE gathering complete, sending offer to server")
         await self._ws.send(json.dumps({
             "type": "offer",
             "sdp": self._pc.localDescription.sdp,
@@ -688,16 +824,19 @@ class NetworkManager(QWidget):
         try:
             if self._ws:
                 await self._ws.send(text)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("WS send failed: %s", e)
 
     def _dc_send_sync(self, data: bytes):
         """Synchronous DC send — called via call_soon_threadsafe."""
         try:
             if self._dc and self._dc.readyState == "open":
                 self._dc.send(data)
-        except Exception:
-            pass
+        except Exception as e:
+            self._dc_send_errors += 1
+            if self._dc_send_errors <= 5 or self._dc_send_errors % 100 == 0:
+                log.warning("DC send failed: %s (total errors: %d)",
+                            e, self._dc_send_errors)
 
     async def _close(self):
         try:
@@ -705,13 +844,13 @@ class NetworkManager(QWidget):
                 await self._pc.close()
                 self._pc = None
                 self._dc = None
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Error closing PC: %s", e)
         try:
             if self._ws:
                 await self._ws.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Error closing WS: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -722,11 +861,15 @@ class ChannelWidget(QFrame):
 
     clicked = pyqtSignal(int)
 
+    _STYLE_IDLE     = "color: #a6adc8; font-size: 12px;"
+    _STYLE_SPEAKING = ("color: #a6e3a1; font-size: 12px; font-weight: bold;")
+
     def __init__(self, channel_id: int, name: str, parent=None):
         super().__init__(parent)
         self.channel_id = channel_id
         self._name      = name
         self._active    = False
+        self._user_labels: dict[str, QLabel] = {}   # name → QLabel
         self.setObjectName("channel")
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumHeight(48)
@@ -770,11 +913,24 @@ class ChannelWidget(QFrame):
             w = self._users_layout.takeAt(0).widget()
             if w:
                 w.deleteLater()
+        self._user_labels.clear()
         self._count_lbl.setText(str(len(names)))
         for n in names:
             lbl = QLabel(f"  \u2022  {n}")
-            lbl.setStyleSheet("color: #a6adc8; font-size: 12px;")
+            lbl.setStyleSheet(self._STYLE_IDLE)
             self._users_layout.addWidget(lbl)
+            self._user_labels[n] = lbl
+
+    def set_speakers(self, speaking_names: list[str]):
+        """Highlight users who are currently speaking."""
+        speaking_set = set(speaking_names)
+        for name, lbl in self._user_labels.items():
+            if name in speaking_set:
+                lbl.setText(f"  \U0001f50a  {name}")
+                lbl.setStyleSheet(self._STYLE_SPEAKING)
+            else:
+                lbl.setText(f"  \u2022  {name}")
+                lbl.setStyleSheet(self._STYLE_IDLE)
 
     def set_active(self, active: bool):
         self._active = active
@@ -1071,6 +1227,11 @@ class ChatPage(QWidget):
         for w in self._widgets:
             w.set_users(data.get(str(w.channel_id), []))
 
+    def update_speakers(self, data: dict):
+        """Highlight speaking users in each channel widget."""
+        for w in self._widgets:
+            w.set_speakers(data.get(str(w.channel_id), []))
+
     # -- open mic toggle -----------------------------------------------------
 
     def _toggle_open_mic(self, checked: bool):
@@ -1219,11 +1380,13 @@ class MainWindow(QMainWindow):
 
         # Signals
         self._login.sig_connect.connect(self._do_connect)
-        self._net.sig_connected.connect(lambda: None)
+        self._net.sig_connected.connect(lambda: log.info("Connected signal received"))
         self._net.sig_welcome.connect(self._on_welcome)
+        self._net.sig_reconnecting.connect(self._on_reconnecting)
         self._net.sig_disconnected.connect(self._on_disconnected)
         self._net.sig_error.connect(self._on_error)
         self._net.sig_user_list.connect(self._on_user_list)
+        self._net.sig_speaking.connect(self._on_speaking)
         self._net.sig_audio.connect(self._on_audio)
         self._ptt_signal.connect(self._on_ptt)
 
@@ -1259,17 +1422,21 @@ class MainWindow(QMainWindow):
     # ── connection ─────────────────────────────────────────────────────────
 
     def _do_connect(self, name: str, address: str):
+        log.info("User connecting as %r to %s", name, address)
         self._username = name
         self._net.connect_to(address, name)
 
     def _on_welcome(self, channels: list[str]):
+        log.info("Welcome received, channels: %s", channels)
         self._show_chat(channels)
 
         self._audio = AudioManager()
         try:
             self._audio.start()
             self._audio.on_audio_data = self._net.send_audio
+            log.info("Audio manager started (has_input=%s)", self._audio._has_input)
         except Exception as e:
+            log.error("Audio init failed: %s\n%s", e, traceback.format_exc())
             QMessageBox.warning(
                 self, "Audio Error",
                 f"Could not initialise audio devices:\n{e}\n\n"
@@ -1282,12 +1449,22 @@ class MainWindow(QMainWindow):
                     "No microphone detected \u2014 you can listen but not talk."
                 )
 
+    def _on_reconnecting(self, attempt: int):
+        log.info("Reconnecting... attempt %d", attempt)
+        if self._chat:
+            self._chat._ch_status.setText(
+                f"Reconnecting... (attempt {attempt})")
+            self._chat._ch_status.setStyleSheet(
+                "font-size: 14px; color: #fab387;")  # orange/warning
+
     def _on_disconnected(self):
+        log.info("Disconnected from server")
         self._cleanup()
         self._login.reset("Disconnected from server.")
         self._show_login()
 
     def _on_error(self, msg: str):
+        log.error("Connection error: %s", msg)
         self._cleanup()
         self._login.reset(f"Connection error: {msg}")
         self._show_login()
@@ -1296,12 +1473,14 @@ class MainWindow(QMainWindow):
 
     def _join_channel(self, cid: int):
         self._current_cid = cid
-        self._net.send_json({"type": "join_channel", "channel_id": cid})
         name = self._channel_names[cid] if cid < len(self._channel_names) else "?"
+        log.info("Joining channel %d (%s)", cid, name)
+        self._net.send_json({"type": "join_channel", "channel_id": cid})
         if self._chat:
             self._chat.set_current_channel(cid, name)
 
     def _leave_channel(self):
+        log.info("Leaving channel")
         self._current_cid = None
         self._net.send_json({"type": "leave_channel"})
         if self._chat:
@@ -1310,6 +1489,10 @@ class MainWindow(QMainWindow):
     def _on_user_list(self, data: dict):
         if self._chat:
             self._chat.update_users(data)
+
+    def _on_speaking(self, data: dict):
+        if self._chat:
+            self._chat.update_speakers(data)
 
     # ── audio ──────────────────────────────────────────────────────────────
 
