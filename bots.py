@@ -10,6 +10,8 @@ Usage:
     python bots.py --count 5 --channel 0        # 5 bots on General
     python bots.py --addr 192.168.1.5:9753 --count 2 --channel 2
     python bots.py --no-tts                     # fallback: sine tones only
+    python bots.py --text "Hello everyone" "Welcome to the server"
+    python bots.py --text-file script.txt       # one line per utterance
 """
 
 import argparse
@@ -331,9 +333,25 @@ async def main():
     parser.add_argument("--no-tts",  action="store_true",     help="Use sine tones instead of TTS")
     parser.add_argument("--voices-dir", type=str, default=None,
                         help="Path to a folder of audio files (ogg/wav/mp3/…) to use instead of TTS")
+    parser.add_argument("--text", nargs="+", default=None,
+                        help="Custom text for bots to speak via TTS (each quoted string is one utterance)")
+    parser.add_argument("--text-file", type=str, default=None,
+                        help="Path to a text file — each non-empty line is one utterance")
     args = parser.parse_args()
 
     count = min(args.count, len(VOICES))
+
+    # ── Collect custom lines from --text / --text-file ────────────────────
+    custom_lines: list[str] | None = None
+
+    if args.text:
+        custom_lines = args.text
+    elif args.text_file:
+        with open(args.text_file, "r", encoding="utf-8") as f:
+            custom_lines = [line.strip() for line in f if line.strip()]
+        if not custom_lines:
+            parser.error(f"No non-empty lines found in {args.text_file}")
+        log.info("Loaded %d line(s) from %s", len(custom_lines), args.text_file)
 
     # ── Generate / load voice clips ───────────────────────────────────────
     all_clips: list[list[np.ndarray]] = []
@@ -357,6 +375,20 @@ async def main():
             freq = 300 + i * 150
             clips = [make_tone_clip(freq, d) for d in [2.0, 1.5, 2.5, 1.8, 2.2]]
             all_clips.append(clips)
+
+    elif custom_lines:
+        # TTS with user-provided text — each bot speaks all lines in its own voice
+        log.info("Generating TTS for %d custom line(s) …", len(custom_lines))
+        for i in range(count):
+            voice_def = VOICES[i]
+            clips = []
+            for line in custom_lines:
+                log.info("  TTS [%s]: %s", voice_def["label"],
+                         line[:50] + "…" if len(line) > 50 else line)
+                pcm = await tts_to_pcm(line, voice_def["voice"])
+                clips.append(pcm)
+            all_clips.append(clips)
+        log.info("All custom clips ready!\n")
 
     else:
         log.info("Generating TTS voice clips (this takes a moment) …")
